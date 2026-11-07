@@ -1,159 +1,158 @@
 """
-Cervical cancer risk prediction: XGBoost vs. a small DNN, with SHAP for
-interpretability.
+Cervical cancer prediction: XGBoost vs. a small neural network, with SHAP
+values for interpretability.
 
 Dataset: UCI "Cervical Cancer (Risk Factors)" - 858 patient records with
-demographic, behavioral, and medical-history features, plus 4 independent
-diagnostic screening results (Hinselmann, Schiller, Citology, Biopsy).
+demographic, behavioural and medical-history risk factors, plus four
+diagnostic results per patient (Hinselmann, Schiller, Citology, Biopsy).
 
-Ground truth: Hinselmann, Schiller, and Citology are each a clinician's
-screening read of the same patient (colposcopy x2 + cytology) - majority
-vote across those 3 gives a consensus label, which is what we predict.
-Biopsy (the histological gold standard) and the Dx:* columns are prior
-diagnosis flags, so they're excluded from the feature set as label leakage.
+Target: the biopsy result, the histological diagnostic standard.
+
+Features: the 28 risk-factor columns only. The three screening tests are
+other diagnostic results for the same patient, and the Dx:* flags record
+diagnoses that may have been made at the same time, so all of them are
+excluded: using them could leak the answer.
+
+Evaluation: 10x repeated stratified 5-fold cross-validation (50 test folds).
+Imputation, scaling and class weights are fitted on each training fold only.
+The same pipeline trained on shuffled labels shows what chance looks like.
 
 Usage:
     python train.py
 """
+import json
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import shap
 import xgboost as xgb
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
-    accuracy_score,
-    classification_report,
-    confusion_matrix,
+    average_precision_score,
+    precision_score,
+    recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import RepeatedStratifiedKFold
+from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
-from tensorflow import keras
-from tensorflow.keras import layers
 
 RANDOM_STATE = 42
+N_SPLITS, N_REPEATS = 5, 10
 
 # ---------------------------------------------------------------------------
-# 1. Load and build the consensus ("3-pathologist majority vote") label
+# 1. Load data: biopsy target, risk-factor features
 # ---------------------------------------------------------------------------
 df = pd.read_csv("data/risk_factors_cervical_cancer.csv")
 df = df.replace("?", np.nan).apply(pd.to_numeric, errors="coerce")
 
-screening_cols = ["Hinselmann", "Schiller", "Citology"]
-df["consensus_positive"] = (df[screening_cols].sum(axis=1) >= 2).astype(int)
-
-leakage_cols = screening_cols + [
-    "Biopsy", "Dx:Cancer", "Dx:CIN", "Dx:HPV", "Dx", "consensus_positive",
-]
-feature_cols = [c for c in df.columns if c not in leakage_cols]
-
+diagnostic_cols = ["Hinselmann", "Schiller", "Citology", "Biopsy", "Dx:Cancer", "Dx:CIN", "Dx:HPV", "Dx"]
+feature_cols = [c for c in df.columns if c not in diagnostic_cols]
 X = df[feature_cols]
-y = df["consensus_positive"]
+y = df["Biopsy"].astype(int)
 
-print(f"Dataset: {len(df)} patients, {len(feature_cols)} features")
-print(f"Consensus-positive rate: {y.mean():.2%} ({y.sum()}/{len(y)})")
-majority_baseline = max(y.mean(), 1 - y.mean())
-print(f"Majority-class baseline accuracy: {majority_baseline:.2%}  <- any model must clear this to mean anything")
+print(f"Dataset: {len(df)} patients, {len(feature_cols)} risk-factor features")
+print(f"Biopsy-positive: {y.sum()} ({y.mean():.1%})")
 
-# ---------------------------------------------------------------------------
-# 2. Impute missing values (many columns use '?' for "not reported")
-# ---------------------------------------------------------------------------
-imputer = SimpleImputer(strategy="median")
-X_imputed = pd.DataFrame(imputer.fit_transform(X), columns=feature_cols)
-
-X_train, X_test, y_train, y_test = train_test_split(
-    X_imputed, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
-)
 
 # ---------------------------------------------------------------------------
-# 3. XGBoost - class-weighted
-#
-# IMPORTANT: an unweighted model on this data just predicts "negative" for
-# every patient - it clears the 94% majority baseline on accuracy alone
-# while catching zero positive cases (0% recall). That's a textbook
-# accuracy-paradox trap, not a working classifier. Weighting trades some
-# raw accuracy for the ability to actually flag at-risk patients, which is
-# what matters here.
+# 2. Models. Everything that learns from data is fitted on the training fold.
 # ---------------------------------------------------------------------------
-scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
+def fit_xgboost(X_train, y_train):
+    imputer = SimpleImputer(strategy="median").fit(X_train)
+    model = xgb.XGBClassifier(
+        n_estimators=100,
+        max_depth=2,
+        learning_rate=0.05,
+        subsample=0.8,
+        scale_pos_weight=(y_train == 0).sum() / (y_train == 1).sum(),
+        eval_metric="logloss",
+        random_state=RANDOM_STATE,
+    )
+    model.fit(imputer.transform(X_train), y_train)
+    return lambda X_new: model.predict_proba(imputer.transform(X_new))[:, 1], model, imputer
 
-xgb_model = xgb.XGBClassifier(
-    n_estimators=200,
-    max_depth=4,
-    learning_rate=0.05,
-    scale_pos_weight=scale_pos_weight,
-    eval_metric="logloss",
-    random_state=RANDOM_STATE,
-)
-xgb_model.fit(X_train, y_train)
 
-xgb_pred = xgb_model.predict(X_test)
-xgb_proba = xgb_model.predict_proba(X_test)[:, 1]
+def fit_network(X_train, y_train):
+    """A 32-16 multilayer perceptron. Positives are oversampled within the training fold to balance the classes."""
+    imputer = SimpleImputer(strategy="median").fit(X_train)
+    scaler = StandardScaler().fit(imputer.transform(X_train))
+    Z, t = scaler.transform(imputer.transform(X_train)), y_train.values
+    pos = np.flatnonzero(t == 1)
+    extra = np.random.default_rng(RANDOM_STATE).choice(pos, size=(t == 0).sum() - len(pos))
+    net = MLPClassifier(hidden_layer_sizes=(32, 16), alpha=1e-2, max_iter=300, random_state=RANDOM_STATE)
+    net.fit(np.vstack([Z, Z[extra]]), np.concatenate([t, t[extra]]))
+    return lambda X_new: net.predict_proba(scaler.transform(imputer.transform(X_new)))[:, 1]
 
-print("\n=== XGBoost ===")
-print("Accuracy:", accuracy_score(y_test, xgb_pred))
-print("ROC AUC:", roc_auc_score(y_test, xgb_proba))
-print(classification_report(y_test, xgb_pred))
-print("Confusion matrix:\n", confusion_matrix(y_test, xgb_pred))
+
+def fold_scores(y_true, proba):
+    pred = (proba >= 0.5).astype(int)
+    return {
+        "roc_auc": roc_auc_score(y_true, proba),
+        "pr_auc": average_precision_score(y_true, proba),
+        "recall": recall_score(y_true, pred, zero_division=0),
+        "precision": precision_score(y_true, pred, zero_division=0),
+    }
+
 
 # ---------------------------------------------------------------------------
-# 4. DNN - same features, scaled, with class weighting
+# 3. Repeated stratified cross-validation, plus a shuffled-label control
 # ---------------------------------------------------------------------------
-scaler = StandardScaler()
-X_train_scaled = scaler.fit_transform(X_train)
-X_test_scaled = scaler.transform(X_test)
+folds = list(RepeatedStratifiedKFold(n_splits=N_SPLITS, n_repeats=N_REPEATS, random_state=RANDOM_STATE).split(X, y))
+y_shuffled = pd.Series(np.random.default_rng(RANDOM_STATE).permutation(y.values), index=y.index)
 
-class_weight = {
-    0: 1.0,
-    1: (y_train == 0).sum() / (y_train == 1).sum(),
+runs = {
+    "XGBoost": (fit_xgboost, y),
+    "Neural network": (fit_network, y),
+    "XGBoost, shuffled labels (chance)": (fit_xgboost, y_shuffled),
 }
+results = {}
+for name, (fit, target) in runs.items():
+    rows = []
+    for k, (tr, te) in enumerate(folds):
+        predict = fit(X.iloc[tr], target.iloc[tr])[0] if fit is fit_xgboost else fit(X.iloc[tr], target.iloc[tr])
+        rows.append(fold_scores(target.iloc[te], predict(X.iloc[te])))
+    res = pd.DataFrame(rows)
+    results[name] = {m: {"mean": float(res[m].mean()), "sd": float(res[m].std())} for m in res.columns}
+    print(f"\n=== {name} ({len(folds)} test folds) ===")
+    for m in res.columns:
+        print(f"  {m:9s} {res[m].mean():.3f} ± {res[m].std():.3f}")
 
-dnn = keras.Sequential([
-    layers.Input(shape=(X_train_scaled.shape[1],)),
-    layers.Dense(32, activation="relu"),
-    layers.Dropout(0.3),
-    layers.Dense(16, activation="relu"),
-    layers.Dropout(0.2),
-    layers.Dense(1, activation="sigmoid"),
-])
-dnn.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
-
-dnn.fit(
-    X_train_scaled, y_train,
-    validation_split=0.15,
-    epochs=60,
-    batch_size=16,
-    class_weight=class_weight,
-    verbose=0,
-)
-
-dnn_proba = dnn.predict(X_test_scaled, verbose=0).ravel()
-dnn_pred = (dnn_proba >= 0.5).astype(int)
-
-print("\n=== DNN ===")
-print("Accuracy:", accuracy_score(y_test, dnn_pred))
-print("ROC AUC:", roc_auc_score(y_test, dnn_proba))
-print(classification_report(y_test, dnn_pred))
-print("Confusion matrix:\n", confusion_matrix(y_test, dnn_pred))
+print(f"\nPR AUC of a random ranking = positive rate = {y.mean():.3f}")
+results["positive_rate"] = float(y.mean())
+with open("results.json", "w") as f:
+    json.dump(results, f, indent=1)
 
 # ---------------------------------------------------------------------------
-# 5. SHAP - feature importance / interpretability for the XGBoost model
+# 4. SHAP: which risk factors the XGBoost model relies on (refit on all data)
 # ---------------------------------------------------------------------------
-explainer = shap.TreeExplainer(xgb_model)
-shap_values = explainer.shap_values(X_test)
+_, final_model, final_imputer = fit_xgboost(X, y)
+X_all = pd.DataFrame(final_imputer.transform(X), columns=feature_cols)
+# XGBoost computes exact TreeSHAP values itself; the last column is the bias term
+shap_values = final_model.get_booster().predict(xgb.DMatrix(X_all), pred_contribs=True)[:, :-1]
 
-mean_abs_shap = pd.Series(
-    np.abs(shap_values).mean(axis=0), index=feature_cols
-).sort_values(ascending=False)
-
+mean_abs_shap = pd.Series(np.abs(shap_values).mean(axis=0), index=feature_cols).sort_values(ascending=False)
 print("\n=== Top 10 features by mean |SHAP value| (XGBoost) ===")
-print(mean_abs_shap.head(10))
+print(mean_abs_shap.head(10).round(4).to_string())
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
-shap.summary_plot(shap_values, X_test, show=False)
+top = mean_abs_shap.index[:12][::-1]
+fig, ax = plt.subplots(figsize=(8, 5.5))
+for i, col in enumerate(top):
+    vals = shap_values[:, feature_cols.index(col)]
+    feat = X_all[col].values
+    span = feat.max() - feat.min()
+    colour = (feat - feat.min()) / span if span else np.zeros_like(feat)
+    jitter = np.random.default_rng(i).uniform(-0.25, 0.25, len(vals))
+    pts = ax.scatter(vals, i + jitter, c=colour, cmap="coolwarm", s=8, alpha=0.7, vmin=0, vmax=1)
+ax.axvline(0, color="#999", lw=0.8)
+ax.set_yticks(range(len(top)), top)
+ax.set_xlabel("SHAP value (impact on predicted risk of a positive biopsy)")
+cbar = fig.colorbar(pts, ax=ax, ticks=[0, 1])
+cbar.ax.set_yticklabels(["low", "high"])
+cbar.set_label("Feature value")
 plt.tight_layout()
 plt.savefig("shap_summary.png", dpi=150)
-print("\nSaved SHAP summary plot to shap_summary.png")
+print("\nSaved results.json and shap_summary.png")
