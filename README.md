@@ -1,6 +1,6 @@
 # Cervical Cancer Risk Prediction
 
-Predicts a positive cervical biopsy from patients' demographic, behavioural and medical-history risk factors. It compares an XGBoost classifier with a small neural network, evaluates both with repeated cross-validation against a chance-level control, and uses SHAP values to show which risk factors the model relies on.
+Predicts a positive cervical biopsy from patients' demographic, behavioural and medical-history risk factors. It compares an XGBoost classifier with a logistic-regression baseline and a small neural network, evaluates them with repeated cross-validation against a chance-level control, tests a clinically meaningful decision threshold, and uses SHAP values to show which risk factors the model relies on.
 
 Data: the UCI [Cervical Cancer (Risk Factors)](https://archive.ics.uci.edu/dataset/383/cervical+cancer+risk+factors) dataset (Fernandes, Cardoso & Fernandes, 2017), 858 patients.
 
@@ -21,17 +21,38 @@ With only 55 positive patients, a single 80/20 split leaves about 11 positives i
 
 ## Results
 
-| Model (50 test folds) | ROC AUC | PR AUC | Recall | Precision |
-|---|---|---|---|---|
-| **XGBoost** | **0.61 ± 0.07** | **0.135 ± 0.05** | 34% | 11% |
-| Neural network (32-16 MLP) | 0.48 ± 0.07 | 0.102 ± 0.04 | 14% | 10% |
-| Shuffled labels (chance) | 0.50 ± 0.07 | 0.076 ± 0.02 | 29% | 6% |
+| Model (50 test folds) | ROC AUC | Middle 95% of folds | PR AUC |
+|---|---|---|---|
+| **XGBoost** | **0.61 ± 0.07** | 0.48 to 0.76 | **0.135** |
+| Logistic regression | 0.56 ± 0.10 | 0.36 to 0.73 | 0.130 |
+| Neural network (32-16 MLP) | 0.48 ± 0.07 | 0.38 to 0.65 | 0.102 |
+| Shuffled labels (chance) | 0.50 ± 0.07 | 0.39 to 0.61 | 0.076 |
 
-PR AUC for a random ranking equals the positive rate, 0.064. Recall and precision use a 0.5 threshold.
+PR AUC for a random ranking equals the positive rate, 0.064.
 
-- **XGBoost finds a real signal.** Its AUC is clearly above the chance control, and its PR AUC is about twice that of a random ranking.
-- **The neural network does not.** With 28 tabular features and 55 positives, it performs at chance level. Gradient-boosted trees are the better fit for data this small.
-- **The signal is modest.** These risk factors raise or lower the odds, but on their own they are far from a diagnostic test.
+Comparisons on the same folds:
+
+- **XGBoost vs. chance:** ROC AUC 0.11 higher, and higher in 84% of folds.
+- **XGBoost vs. logistic regression:** 0.05 higher, and higher in 76% of folds.
+- **XGBoost vs. the neural network:** 0.13 higher, and higher in 90% of folds. With 28 tabular features and 55 positives, the network performs at chance level.
+
+**XGBoost finds a real but modest signal.** These risk factors shift the odds of a positive biopsy, but they are far from a diagnostic test.
+
+### At a screening threshold
+
+A screening tool has to catch most positive cases. Inside each training fold, a cutoff is chosen (using an inner cross-validation) to reach 80% recall, then applied unchanged to the test fold:
+
+| | Mean across 50 folds |
+|---|---|
+| Recall | 87% |
+| Patients flagged | 86% |
+| Precision | 6.5% (base rate 6.4%) |
+
+**To catch most positive biopsies, the model has to flag almost everyone.** Risk factors alone cannot replace screening tests, and that is the main practical conclusion of this project.
+
+### A shortcut the model found, and why it is not used
+
+Adding "this value was missing" indicators raises ROC AUC to 0.64, higher in 78% of folds. Almost all of that gain comes from one artifact: **none of the 108 patients with no contraceptive history recorded had a positive biopsy** (against 7.3% of everyone else). The model learns that a blank answer means low risk. That reflects how this dataset was collected, not cervical cancer, and it would not hold for new patients. The main model therefore leaves missingness indicators out.
 
 ### How we got here
 
@@ -41,14 +62,17 @@ The first version predicted a majority vote of the three screening tests and was
 
 ![SHAP values for the XGBoost model](shap_summary.png)
 
-SHAP values come from XGBoost's built-in TreeSHAP (`pred_contribs=True`) on the model refit to all patients. The largest effects:
+SHAP values come from XGBoost's built-in TreeSHAP (`pred_contribs=True`). To check that they are stable, they are computed separately in each of the 50 folds, from a model trained on that fold's training data and evaluated on its test data. These factors appear in the top five most often:
 
-- **First sexual intercourse:** a later age lowers predicted risk.
-- **Hormonal contraceptives (years):** longer use raises predicted risk.
-- **Age and number of pregnancies.**
-- **Any STD history:** raises predicted risk.
+| Risk factor | In the SHAP top five |
+|---|---|
+| Age at first intercourse | 100% of folds |
+| Hormonal contraceptives (years) | 100% |
+| Age | 100% |
+| Number of pregnancies | 96% |
+| Any STD history | 72% |
 
-These patterns are consistent with known risk factors in the clinical literature. SHAP describes what the model learned from this data; it does not establish cause.
+The plot shows the model refit to all patients. A later age at first intercourse lowers predicted risk, while longer hormonal contraceptive use and any STD history raise it. These patterns are consistent with known risk factors in the clinical literature. SHAP describes what the model learned from this data; it does not establish cause.
 
 ## Run it
 
