@@ -21,14 +21,16 @@ With only 55 positive patients, a single 80/20 split leaves about 11 positives i
 
 ## Results
 
-| Model (50 test folds) | ROC AUC | Middle 95% of folds | PR AUC |
-|---|---|---|---|
-| **XGBoost** | **0.61 ± 0.07** | 0.48 to 0.76 | **0.135** |
-| Logistic regression | 0.56 ± 0.10 | 0.36 to 0.73 | 0.130 |
-| Neural network (32-16 MLP) | 0.48 ± 0.07 | 0.38 to 0.65 | 0.102 |
-| Shuffled labels (chance) | 0.50 ± 0.07 | 0.39 to 0.61 | 0.076 |
+| Model (50 test folds) | ROC AUC | Middle 95% of folds | PR AUC | Accuracy (0.5 cutoff) |
+|---|---|---|---|---|
+| **XGBoost** | **0.61 ± 0.07** | 0.48 to 0.76 | **0.135** | 77.3% |
+| Logistic regression | 0.56 ± 0.10 | 0.36 to 0.73 | 0.130 | 75.3% |
+| Neural network (32-16 MLP) | 0.48 ± 0.07 | 0.38 to 0.65 | 0.102 | 85.7% |
+| Shuffled labels (chance) | 0.50 ± 0.07 | 0.39 to 0.61 | 0.076 | 67.3% |
 
 PR AUC for a random ranking equals the positive rate, 0.064.
+
+Accuracy is reported for completeness but is not used to compare models. Predicting "negative" for every patient scores 93.6% while missing every positive biopsy, and the neural network, which ranks patients no better than chance, has the highest accuracy here.
 
 Comparisons on the same folds:
 
@@ -47,6 +49,7 @@ A screening tool has to catch most positive cases. Inside each training fold, a 
 | Recall | 87% |
 | Patients flagged | 86% |
 | Precision | 6.5% (base rate 6.4%) |
+| Accuracy | 19.2% |
 
 **To catch most positive biopsies, the model has to flag almost everyone.** Risk factors alone cannot replace screening tests, and that is the main practical conclusion of this project.
 

@@ -31,7 +31,7 @@ import pandas as pd
 import xgboost as xgb
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.metrics import accuracy_score, average_precision_score, roc_auc_score
 from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedKFold
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
@@ -125,7 +125,8 @@ for name, (fit, target) in runs.items():
     for tr, te in folds:
         scores = fit(X.iloc[tr], target.iloc[tr])(X.iloc[te])
         rows.append({"roc_auc": roc_auc_score(target.iloc[te], scores),
-                     "pr_auc": average_precision_score(target.iloc[te], scores)})
+                     "pr_auc": average_precision_score(target.iloc[te], scores),
+                     "accuracy": accuracy_score(target.iloc[te], scores >= 0.5)})
     res = pd.DataFrame(rows)
     fold_auc[name] = res["roc_auc"].values
     summary[name] = {
@@ -135,8 +136,9 @@ for name, (fit, target) in runs.items():
     }
     a = summary[name]["roc_auc"]
     print(f"{name:36s} ROC AUC {a['mean']:.3f} ± {a['sd']:.3f}  (95% of folds: {a['p2.5']:.2f} to {a['p97.5']:.2f})"
-          f"   PR AUC {summary[name]['pr_auc']['mean']:.3f}")
+          f"   PR AUC {summary[name]['pr_auc']['mean']:.3f}   accuracy at 0.5 {summary[name]['accuracy']['mean']:.1%}")
 print(f"PR AUC of a random ranking = positive rate = {y.mean():.3f}")
+print(f"Accuracy of predicting 'negative' for everyone = {1 - y.mean():.1%}")
 
 # Why missingness indicators are not used: the gain comes from a data-collection artifact
 hc_missing = X["Hormonal Contraceptives"].isna()
@@ -165,12 +167,13 @@ for tr, te in folds:
         "recall": flagged[y_te == 1].mean(),
         "precision": y_te[flagged].mean() if flagged.any() else 0.0,
         "flagged_share": flagged.mean(),
+        "accuracy": (flagged == y_te).mean(),
     })
 thr = pd.DataFrame(rows)
 threshold = {k: {"mean": float(thr[k].mean()), "sd": float(thr[k].std())} for k in thr.columns}
 print(f"\nThreshold chosen inside each training fold for {TARGET_RECALL:.0%} recall, applied to the test fold:")
 print(f"  recall {thr['recall'].mean():.2f} ± {thr['recall'].std():.2f}, precision {thr['precision'].mean():.3f} "
-      f"(base rate {y.mean():.3f}), patients flagged {thr['flagged_share'].mean():.0%}")
+      f"(base rate {y.mean():.3f}), patients flagged {thr['flagged_share'].mean():.0%}, accuracy {thr['accuracy'].mean():.1%}")
 
 # ---------------------------------------------------------------------------
 # 5. SHAP values and how stable the top risk factors are across folds
